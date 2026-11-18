@@ -1,0 +1,11 @@
+{
+  "description": "session-relay: share findings between running Claude Code sessions. Stop posts the turn's final message to a local feed; PostToolUse injects relevant posts from other sessions.",
+  "hooks": {
+    "PostToolUse": [
+      {"hooks": [{"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay_hook.py\" post-tool", "timeout": 3}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/relay_hook.py\" stop", "timeout": 5}]}
+    ]
+  }
+}

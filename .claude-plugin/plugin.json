@@ -1,0 +1,18 @@
+{
+  "name": "session-relay",
+  "version": "0.1.0",
+  "description": "Live idea relay between parallel Claude Code sessions: a finding in one session is pushed into other running sessions working on the same thing, mid-task. Local, stdlib-only, no network.",
+  "license": "MIT",
+  "keywords": [
+    "multi-session",
+    "parallel",
+    "agents",
+    "memory",
+    "hooks"
+  ],
+  "author": {
+    "name": "buzzedaldrinx86-creator"
+  },
+  "repository": "https://github.com/buzzedaldrinx86-creator/session-relay",
+  "homepage": "https://github.com/buzzedaldrinx86-creator/session-relay"
+}

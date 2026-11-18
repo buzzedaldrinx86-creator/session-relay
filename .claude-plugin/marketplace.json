@@ -1,0 +1,14 @@
+{
+  "name": "session-relay",
+  "description": "Live idea relay between parallel Claude Code sessions.",
+  "owner": {
+    "name": "buzzedaldrinx86-creator"
+  },
+  "plugins": [
+    {
+      "name": "session-relay",
+      "source": "./",
+      "description": "Push one Claude Code session's findings into other running sessions working on the same thing, mid-task. Local, stdlib-only, no network."
+    }
+  ]
+}
