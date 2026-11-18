@@ -104,7 +104,7 @@ def post(text, session="manual", title="", source="manual", ref=""):
     os.makedirs(ROOT, exist_ok=True)
     rec = {"ts": time.time(), "session": session, "title": title[:120], "source": source,
            "ref": ref, "text": text[:MAX_POST_CHARS]}
-    rec["id"] = "%s-%d" % (session[:8], int(rec["ts"] * 1000))
+    rec["id"] = "%s-%d-%s" % (session[:8], time.time_ns(), os.urandom(4).hex())   # unique within a batch
     line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
     fd = os.open(FEED, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
@@ -301,6 +301,8 @@ def hook_stop(event):
 
 def hook_post_tool(event, now=None):
     now = now or time.time()
+    if os.environ.get("RELAY_OFF") == "1":        # opt a session out of receiving
+        return None
     sid = event.get("session_id") or ""
     tp = event.get("transcript_path") or ""
     if not isinstance(sid, str) or not isinstance(tp, str) or not sid or not tp \

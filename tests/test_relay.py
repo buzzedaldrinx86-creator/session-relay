@@ -140,6 +140,27 @@ class Hook(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.root, "pdata", "feed.jsonl")))
 
 
+class Fixes010(unittest.TestCase):
+    def test_batch_ids_unique(self):
+        root = tempfile.mkdtemp(prefix="relaytest-")
+        os.environ["RELAY_ROOT"] = root
+        try:
+            import importlib; importlib.reload(relay)
+            ids = [relay.post("post %d" % i, session="S")["id"] for i in range(5)]
+        finally:
+            del os.environ["RELAY_ROOT"]; import importlib; importlib.reload(relay); shutil.rmtree(root, True)
+        self.assertEqual(len(set(ids)), 5, ids)
+
+    def test_relay_off(self):
+        h = Hook("test_irrelevant_not_injected"); h.setUp()
+        try:
+            relay_post(h.root, "C", POSTS["billing"])
+            r = h.run_hook("post-tool", "A", h.tA, env=dict(h.env, RELAY_OFF="1"))
+            self.assertEqual((r.returncode, r.stdout), (0, ""))
+        finally:
+            h.tearDown()
+
+
 def relay_post(root, sid, text):
     with open(os.path.join(root, "feed.jsonl"), "a") as f:
         f.write(json.dumps({"ts": time.time(), "session": sid, "id": "%s-%d" % (sid, time.time_ns()), "text": text}) + "\n")

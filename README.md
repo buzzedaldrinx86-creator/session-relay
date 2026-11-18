@@ -45,7 +45,7 @@ python3 scripts/relay.py post "text" --title "…"   # post by hand
 python3 scripts/relay.py score "task" "post"       # why did / didn't this match?
 ```
 
-Set `RELAY_THRESHOLD=99` to silence matching without uninstalling.
+Set `RELAY_OFF=1` in a session's environment to stop it receiving posts (for example a reviewer that must stay blind to other sessions' work), or `RELAY_THRESHOLD=99` to silence matching everywhere without uninstalling.
 
 ## Limits
 
@@ -60,7 +60,7 @@ Set `RELAY_THRESHOLD=99` to silence matching without uninstalling.
 
 ## Tests
 
-`python3 tests/test_relay.py` runs 10 tests:
+`python3 tests/test_relay.py` runs 12 tests:
 
 - 6 related pairs that must match.
 - 6 unrelated pairs that must not.
