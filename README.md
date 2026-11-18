@@ -45,7 +45,7 @@ python3 scripts/relay.py post "text" --title "…"   # post by hand
 python3 scripts/relay.py score "task" "post"       # why did / didn't this match?
 ```
 
-Set `RELAY_OFF=1` in a session's environment to stop it receiving posts (for example a reviewer that must stay blind to other sessions' work), or `RELAY_THRESHOLD=99` to silence matching everywhere without uninstalling.
+To stop a session receiving posts (for example a reviewer that must stay blind to other sessions' work), start it with `RELAY_OFF=1 claude`. The hooks read the variable from the environment Claude Code was started in, so setting it later from inside the session (for example in its Bash tool) has no effect. Set `RELAY_THRESHOLD=99` the same way to silence matching without uninstalling.
 
 ## Limits
 
