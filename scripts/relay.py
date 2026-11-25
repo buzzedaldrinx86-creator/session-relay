@@ -29,6 +29,8 @@ MAX_AGE_S = 6 * 3600        # ignore posts older than this
 COOLDOWN_S = 300            # at most one injection per session per 5 minutes
 MAX_PER_INJECT = 2
 MAX_POST_CHARS = 700
+FEED_MAX_BYTES = int(os.environ.get("RELAY_FEED_MAX_BYTES", 4_000_000))  # compact the feed past this
+FEED_TAIL_BYTES = FEED_MAX_BYTES    # a first feed read starts at most this far from the end
 
 STOP = set("""
 a about above after again against all also am an and any are as at be because been before being below
@@ -106,14 +108,72 @@ def post(text, session="manual", title="", source="manual", ref=""):
            "ref": ref, "text": text[:MAX_POST_CHARS]}
     rec["id"] = "%s-%d-%s" % (session[:8], time.time_ns(), os.urandom(4).hex())   # unique within a batch
     line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(FEED, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    lock = os.open(os.path.join(ROOT, ".feed.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        os.write(fd, line)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        fd = os.open(FEED, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, line)
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if size > FEED_MAX_BYTES:
+            compact_feed()
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        os.close(lock)
     return rec
+
+
+def compact_feed():
+    """Keep the append-only feed from growing without limit: rewrite it with only the posts
+    within MAX_AGE_S (or the last 1000 if that is somehow still everything). The caller holds
+    the feed lock. Atomic: write a temp file and os.replace it, so a lockless reader always sees
+    either the whole old feed or the whole new one, never a half-written file. Readers whose
+    stored byte offset now exceeds the (smaller) feed reset to the tail; the injected-id set
+    stops any re-read from re-injecting."""
+    posts, _ = read_feed(0)
+    cutoff = time.time() - MAX_AGE_S
+    recent = [p for p in posts if float(p.get("ts", 0)) >= cutoff]
+    # Bound bytes too, not just age: keep the newest posts that fit in ~80% of the cap (the
+    # headroom gives hysteresis, so a steady stream does not recompact on every post). Fall
+    # back to the whole set if the age filter emptied it, so one burst cannot blank the feed.
+    target = int(FEED_MAX_BYTES * 0.8)
+    src = recent or posts
+    keep, total = [], 0
+    for p in reversed(src):                      # newest first
+        b = len((json.dumps(p, ensure_ascii=False) + "\n").encode("utf-8"))
+        if keep and total + b > target:
+            break
+        keep.append(p)
+        total += b
+    keep.reverse()
+    fd, tmp = tempfile.mkstemp(dir=ROOT, prefix=".feedtmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            for p in keep:
+                f.write((json.dumps(p, ensure_ascii=False) + "\n").encode("utf-8"))
+        os.replace(tmp, FEED)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def tail_offset(size):
+    """Byte offset for a bounded first read of the feed: start at most FEED_TAIL_BYTES from the
+    end, aligned to the next line start. A small feed -> 0 (read it all)."""
+    if size <= FEED_TAIL_BYTES:
+        return 0
+    try:
+        with open(FEED, "rb") as f:
+            f.seek(size - FEED_TAIL_BYTES)
+            f.readline()                 # discard the partial line we may have landed inside
+            return f.tell()
+    except OSError:
+        return 0
 
 
 # ---------------------------------------------------------------- scoring
@@ -311,9 +371,10 @@ def hook_post_tool(event, now=None):
     st = load_state(sid)
     fsize = os.path.getsize(FEED)
     off = st.get("off")
-    if off is None:
-        # first call in this session: start from posts of the last MAX_AGE_S only
-        off = 0
+    if off is None or off > fsize:
+        # first call in this session, or the feed was compacted since last time: bound the read
+        # to the tail. The age filter below drops anything older than MAX_AGE_S anyway.
+        off = tail_offset(fsize)
     queue = st.get("queue", [])
     if off >= fsize and not queue:
         return None                                   # fast path: nothing new
