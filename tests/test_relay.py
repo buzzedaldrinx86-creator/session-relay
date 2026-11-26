@@ -2,6 +2,7 @@
 """session-relay tests. Run: python3 tests/test_relay.py   (stdlib only, Python 3.8+)
 Relevance fixtures are fictional projects scored against the shipped baseline (base_df.json)."""
 import json, os, shutil, subprocess, sys, tempfile, time, unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
@@ -83,7 +84,8 @@ def transcript(path, prompt, final=None):
 class Hook(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="relaytest-")
-        self.env = dict(os.environ, RELAY_ROOT=self.root)
+        self.env = {key: value for key, value in os.environ.items() if not key.startswith("RELAY_")}
+        self.env["RELAY_ROOT"] = self.root
         self.tA, self.tB = os.path.join(self.root, "A.jsonl"), os.path.join(self.root, "B.jsonl")
         transcript(self.tA, TASKS["billing"])
         transcript(self.tB, "Look into why the ledger has duplicates.", final=POSTS["billing"])
@@ -91,34 +93,101 @@ class Hook(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
 
-    def run_hook(self, mode, sid=None, tp=None, raw=None, env=None):
-        inp = raw if raw is not None else json.dumps({"session_id": sid, "transcript_path": tp})
+    def run_hook(self, mode, sid=None, tp=None, raw=None, env=None, final=None):
+        inp = raw if raw is not None else json.dumps({
+            "session_id": sid, "transcript_path": tp, "last_assistant_message": final,
+        })
         return subprocess.run([sys.executable, "-I", HOOK, mode], input=inp, capture_output=True,
                               text=True, env=env or self.env, timeout=20)
 
-    def test_stop_posts_final_message_and_peer_receives_it(self):
-        self.assertEqual(self.run_hook("stop", "B", self.tB).stdout, "")
-        self.run_hook("stop", "B", self.tB)                       # idempotent
-        feed = [json.loads(l) for l in open(os.path.join(self.root, "feed.jsonl"))]
-        self.assertEqual(len(feed), 1)
-        out = self.run_hook("post-tool", "A", self.tA).stdout
-        ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
-        self.assertIn("idempotency", ctx)
-        self.assertIn("not an instruction", ctx)
-        self.assertEqual(self.run_hook("post-tool", "B", self.tB).stdout, "")   # never your own post
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, "-I", os.path.join(SCRIPTS, "relay.py"), *args],
+                              capture_output=True, text=True, env=self.env, check=True)
+
+    def test_stop_posts_final_message_for_manual_review(self):
+        self.assertEqual(self.run_hook("stop", "B", self.tB, final=POSTS["billing"]).stdout, "")
+        self.run_hook("stop", "B", self.tB, final=POSTS["billing"])
+        with open(os.path.join(self.root, "feed.jsonl")) as feed:
+            self.assertEqual(len(feed.readlines()), 1)
+        output = self.run_hook("post-tool", "A", self.tA).stdout
+        notice = json.loads(output)
+        self.assertIn("systemMessage", notice)
+        self.assertNotIn("hookSpecificOutput", notice)
+        self.assertNotIn("idempotency", output)
+        self.assertIn("idempotency", self.run_cli("inbox", "--session", "A").stdout)
+        self.assertEqual(self.run_hook("post-tool", "B", self.tB).stdout, "")
+
+    def test_stop_uses_even_a_short_host_final_response(self):
+        self.run_hook("stop", "B", self.tB, final="Done.")
+        feed = self.run_cli("tail").stdout
+        self.assertIn("Done.", feed)
+        self.assertNotIn("idempotency", feed)
+
+    def test_stop_without_host_final_response_leaves_feed_empty(self):
+        self.run_hook("stop", "B", self.tB)
+        self.assertEqual(self.run_cli("tail").stdout, "")
 
     def test_irrelevant_not_injected(self):
         relay_post(self.root, "C", POSTS["game"])
         self.assertEqual(self.run_hook("post-tool", "A", self.tA).stdout, "")
 
-    def test_cooldown_then_delivery(self):
+    def test_cooldown_defers_the_notice_without_hiding_matches(self):
         relay_post(self.root, "C", POSTS["billing"])
-        self.assertIn("idempotency", self.run_hook("post-tool", "A", self.tA).stdout)
+        self.assertIn("systemMessage", json.loads(self.run_hook("post-tool", "A", self.tA).stdout))
         relay_post(self.root, "D", "Stripe invoice.paid retries also hit the refund webhook; same ledger duplicate fix applies.")
         self.assertEqual(self.run_hook("post-tool", "A", self.tA).stdout, "")
-        stp = os.path.join(self.root, "state", "A.json")
-        st = json.load(open(stp)); st["last_inject"] = time.time() - 400; json.dump(st, open(stp, "w"))
-        self.assertIn("refund", self.run_hook("post-tool", "A", self.tA).stdout)
+        self.assertIn("refund", self.run_cli("inbox", "--session", "A").stdout)
+        state = os.path.join(self.root, "state", "A.json")
+        with open(state) as f:
+            data = json.load(f)
+        data["last_notice"] = time.time() - 400
+        with open(state, "w") as f:
+            json.dump(data, f)
+        self.assertIn("systemMessage", json.loads(self.run_hook("post-tool", "A", self.tA).stdout))
+
+    def test_tail_formats_each_record_as_one_printable_line(self):
+        self.run_cli("post", "First\nSecond\tThird", "--title", "Status\nUpdate",
+                     "--session", "peer\tA")
+        output = self.run_cli("tail").stdout
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertTrue(all(c.isprintable() for c in output.rstrip("\n")))
+        self.assertIn("Status Update", output)
+        self.assertIn("First Second Third", output)
+
+    def test_post_refuses_storage_with_group_writes(self):
+        os.chmod(self.root, 0o770)
+        result = self.run_hook("stop", "B", self.tB, final="Routine update.")
+        self.assertEqual((result.returncode, result.stdout), (0, ""))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "feed.jsonl")))
+
+    def test_relay_refuses_linked_storage_entries(self):
+        reference = os.path.join(self.root, "fixture.txt")
+        for name in ("feed.jsonl", ".feed.lock"):
+            with self.subTest(name=name):
+                entry = os.path.join(self.root, name)
+                with open(reference, "w") as f:
+                    f.write("fixture\n")
+                os.symlink(reference, entry)
+                try:
+                    response = self.run_hook("stop", "B", self.tB, final="Routine update.")
+                    self.assertEqual((response.returncode, response.stdout), (0, ""))
+                    with open(reference) as f:
+                        self.assertEqual(f.read(), "fixture\n")
+                    self.assertTrue(os.path.islink(entry))
+                    if name == ".feed.lock":
+                        self.assertFalse(os.path.lexists(os.path.join(self.root, "feed.jsonl")))
+                finally:
+                    os.unlink(entry)
+                    # The refused feed case can still create a valid lock.
+                    lock = os.path.join(self.root, ".feed.lock")
+                    if os.path.exists(lock):
+                        os.unlink(lock)
+
+    def test_relay_files_are_created_for_the_owner_only(self):
+        self.run_hook("stop", "B", self.tB, final="Routine update.")
+        for path in ("feed.jsonl", ".feed.lock", "state/B.json"):
+            with self.subTest(path=path):
+                self.assertEqual(os.stat(os.path.join(self.root, path)).st_mode & 0o777, 0o600)
 
     def test_silent_on_bad_input(self):
         for raw in ["", "not json", "[1]", "null", '{"session_id": 5, "transcript_path": []}']:
@@ -136,7 +205,7 @@ class Hook(unittest.TestCase):
     def test_data_dir_falls_back_to_plugin_data(self):
         env = {k: v for k, v in self.env.items() if k != "RELAY_ROOT"}
         env["CLAUDE_PLUGIN_DATA"] = os.path.join(self.root, "pdata")
-        self.run_hook("stop", "B", self.tB, env=env)
+        self.run_hook("stop", "B", self.tB, env=env, final=POSTS["billing"])
         self.assertTrue(os.path.exists(os.path.join(self.root, "pdata", "feed.jsonl")))
 
 
@@ -159,6 +228,102 @@ class Fixes010(unittest.TestCase):
             self.assertEqual((r.returncode, r.stdout), (0, ""))
         finally:
             h.tearDown()
+
+
+class Fixes011(unittest.TestCase):
+    """Regression coverage for feed admission, incremental reads and compaction."""
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="relaytest-")
+        os.environ["RELAY_ROOT"] = self.root
+        os.environ["RELAY_FEED_MAX_BYTES"] = "20000"
+        import importlib; importlib.reload(relay)
+        self.tp = os.path.join(self.root, "t.jsonl")
+        with open(self.tp, "w") as f:
+            f.write(json.dumps({"type": "user", "message": {"content": TASKS["billing"]}}) + "\n")
+
+    def tearDown(self):
+        del os.environ["RELAY_ROOT"]; del os.environ["RELAY_FEED_MAX_BYTES"]
+        import importlib; importlib.reload(relay); shutil.rmtree(self.root, True)
+
+    def test_bad_record_does_not_stall_reader_or_compaction(self):
+        relay.post(POSTS["billing"], session="peerA")
+        with open(relay.FEED, "a") as f:
+            for bad in ({"text": "x", "ts": "abc"}, {"text": "x", "ts": None}, {"text": "x", "ts": "inf"},
+                        {"text": "x", "ts": 1, "session": 7}, {"text": "x", "ts": 1, "title": ["t"]}):
+                f.write(json.dumps(bad) + "\n")
+        out = relay.hook_post_tool({"session_id": "me", "transcript_path": self.tp})
+        self.assertIsNotNone(out)                                  # the good post still arrives
+        self.assertEqual(relay.load_state("me")["off"], os.path.getsize(relay.FEED))
+        relay.compact_feed()                                       # must not raise
+        self.assertEqual(len(relay.read_feed(0)[0]), 1)
+
+    def test_lagging_reader_receives_a_post_retained_by_compaction(self):
+        event = {"session_id": "me", "transcript_path": self.tp}
+        for i in range(10):
+            relay.post("Archive item %02d " % i + "x" * 300, session="peerA")
+        relay.hook_post_tool(event)
+        stale = relay.load_state("me")["off"]
+        original_inode = os.stat(relay.FEED).st_ino
+        item = relay.post(POSTS["billing"], session="peerA")
+        for i in range(37):
+            relay.post("Background item %02d " % i + "y" * 300, session="peerA")
+        with open(relay.FEED, "rb") as feed:
+            retained = feed.read()
+        self.assertNotEqual(os.stat(relay.FEED).st_ino, original_inode)
+        self.assertLess(stale, len(retained))
+        self.assertIn(item["id"].encode(), retained[:stale])
+        relay.hook_post_tool(event)
+        queued = relay.load_state("me")["queue"]
+        self.assertEqual([p["id"] for p in queued], [item["id"]])
+
+    def test_incremental_read_makes_progress_within_a_byte_budget(self):
+        first = relay.post("Routine background entry " + "x" * 400, session="peerA")
+        second = relay.post(POSTS["billing"], session="peerA")
+        event = {"session_id": "me", "transcript_path": self.tp}
+        with patch.object(relay, "HOOK_FEED_READ_BYTES", 600):
+            self.assertIsNone(relay.hook_post_tool(event))
+            self.assertLess(relay.load_state("me")["off"], os.path.getsize(relay.FEED))
+            relay.hook_post_tool(event)
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertEqual([p["id"] for p in relay.load_state("me")["queue"]], [second["id"]])
+
+    def test_read_continues_after_a_legacy_record_above_the_record_limit(self):
+        relay.post("Legacy entry " + "x" * 550, session="peerA")
+        newer = relay.post(POSTS["billing"], session="peerA")
+        event = {"session_id": "me", "transcript_path": self.tp}
+        with patch.object(relay, "MAX_FEED_LINE_BYTES", 300), patch.object(relay, "HOOK_FEED_READ_BYTES", 400):
+            for _ in range(3):
+                relay.hook_post_tool(event)
+        self.assertEqual([p["id"] for p in relay.load_state("me")["queue"]], [newer["id"]])
+
+    def test_a_post_preserves_the_previous_row_when_only_its_newline_is_missing(self):
+        original = relay.post("Earlier note", session="peerA")
+        with open(relay.FEED, "r+b") as feed:
+            feed.truncate(os.path.getsize(relay.FEED) - 1)
+        latest = relay.post("Later note", session="peerB")
+        items, _ = relay.read_feed()
+        self.assertEqual([p["id"] for p in items], [original["id"], latest["id"]])
+
+    def test_tail_window_includes_the_record_starting_exactly_at_its_boundary(self):
+        relay.post("Earlier note", session="peerA")
+        earlier_size = os.path.getsize(relay.FEED)
+        latest = relay.post("Later note", session="peerB")
+        with patch.object(relay, "FEED_TAIL_BYTES", os.path.getsize(relay.FEED) - earlier_size):
+            items, _ = relay.read_feed()
+        self.assertEqual([p["id"] for p in items], [latest["id"]])
+
+    def test_complete_record_after_a_partial_append_is_seen_once(self):
+        event = {"session_id": "me", "transcript_path": self.tp}
+        record = {"id": "example", "session": "peerA", "ts": time.time(), "text": POSTS["billing"]}
+        encoded = json.dumps(record).encode()
+        with open(relay.FEED, "wb") as feed:
+            feed.write(encoded[:40])
+        self.assertIsNone(relay.hook_post_tool(event))
+        with open(relay.FEED, "ab") as feed:
+            feed.write(encoded[40:] + b"\n")
+        relay.hook_post_tool(event)
+        relay.hook_post_tool(event)
+        self.assertEqual([p["id"] for p in relay.load_state("me")["queue"]], ["example"])
 
 
 def relay_post(root, sid, text):

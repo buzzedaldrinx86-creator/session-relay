@@ -1,7 +1,7 @@
 {
   "name": "session-relay",
   "version": "0.1.1",
-  "description": "Live idea relay between parallel Claude Code sessions: a finding in one session is pushed into other running sessions working on the same thing, mid-task. Local, stdlib-only, no network.",
+  "description": "Matches posts between parallel Claude Code sessions and notifies you when a match is ready for local review. Python standard library only.",
   "license": "MIT",
   "keywords": [
     "multi-session",
