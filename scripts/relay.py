@@ -55,7 +55,7 @@ TOKEN = re.compile(r"[a-z0-9][a-z0-9_\-\./]*[a-z0-9]|[a-z0-9]")
 
 def log_error(where):
     try:
-        os.makedirs(ROOT, exist_ok=True)
+        os.makedirs(ROOT, mode=0o700, exist_ok=True)
         with open(ERRLOG, "a") as f:
             f.write("%s %s\n%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), where, traceback.format_exc()))
     except Exception:
@@ -76,17 +76,39 @@ def tokens(text):
 
 # ---------------------------------------------------------------- feed
 
-def read_feed(offset=0):
-    """Return (posts, end_offset). Missing feed -> ([], 0). Bad lines are skipped."""
-    if not os.path.exists(FEED):
-        return [], 0
+def valid_post(p):
+    """A feed record every consumer can use: non-empty text, a finite numeric ts, string metadata.
+    Normalises ts to float in place. Anything else is skipped on its own, so one bad line can
+    neither stall a reader (re-raising on the same offset forever) nor break compaction."""
+    if not isinstance(p, dict) or not isinstance(p.get("text"), str) or not p["text"]:
+        return False
+    try:
+        ts = float(p.get("ts", 0))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(ts):
+        return False
+    if not all(isinstance(p.get(k, ""), str) for k in ("session", "title", "id", "source", "ref")):
+        return False
+    p["ts"] = ts
+    return True
+
+
+def read_feed_at(offset=0):
+    """Return (posts, end_offset, inode of the file read). Missing feed -> ([], 0, None).
+    Bad lines are skipped. The inode lets a reader notice that compaction replaced the file."""
+    try:
+        f = open(FEED, "rb")
+    except FileNotFoundError:
+        return [], 0, None
     posts = []
-    with open(FEED, "rb") as f:
+    with f:
+        ino = os.fstat(f.fileno()).st_ino
         f.seek(offset)
         data = f.read()
     last_nl = data.rfind(b"\n")
     if last_nl < 0:
-        return [], offset            # only a partial line (writer mid-append): wait
+        return [], offset, ino       # only a partial line (writer mid-append): wait
     for raw in data[:last_nl].split(b"\n"):
         if not raw.strip():
             continue
@@ -94,16 +116,30 @@ def read_feed(offset=0):
             p = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
             continue
-        if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"]:
+        if valid_post(p):
             posts.append(p)
-    return posts, offset + last_nl + 1
+    return posts, offset + last_nl + 1, ino
+
+
+def read_feed(offset=0):
+    """Return (posts, end_offset). Missing feed -> ([], 0). Bad lines are skipped."""
+    posts, end, _ino = read_feed_at(offset)
+    return posts, end
+
+
+def flat(s, limit=None):
+    """Peer-supplied text on one line with no control characters, so a post cannot forge extra
+    lines in an injected context block or send escape sequences to a terminal."""
+    s = "".join(ch if ch.isprintable() else " " for ch in str(s))
+    s = " ".join(s.split())
+    return s[:limit] if limit else s
 
 
 def post(text, session="manual", title="", source="manual", ref=""):
     text = (text or "").strip()
     if not text:
         raise ValueError("empty post")
-    os.makedirs(ROOT, exist_ok=True)
+    os.makedirs(ROOT, mode=0o700, exist_ok=True)
     rec = {"ts": time.time(), "session": session, "title": title[:120], "source": source,
            "ref": ref, "text": text[:MAX_POST_CHARS]}
     rec["id"] = "%s-%d-%s" % (session[:8], time.time_ns(), os.urandom(4).hex())   # unique within a batch
@@ -118,7 +154,12 @@ def post(text, session="manual", title="", source="manual", ref=""):
         finally:
             os.close(fd)
         if size > FEED_MAX_BYTES:
-            compact_feed()
+            try:
+                compact_feed()
+            except Exception:
+                # The post is already written: report success, or a Stop hook would re-post it
+                # on every turn. A failed compaction is retried on the next post.
+                log_error("compact_feed")
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         os.close(lock)
@@ -129,9 +170,10 @@ def compact_feed():
     """Keep the append-only feed from growing without limit: rewrite it with only the posts
     within MAX_AGE_S (or the last 1000 if that is somehow still everything). The caller holds
     the feed lock. Atomic: write a temp file and os.replace it, so a lockless reader always sees
-    either the whole old feed or the whole new one, never a half-written file. Readers whose
-    stored byte offset now exceeds the (smaller) feed reset to the tail; the injected-id set
-    stops any re-read from re-injecting."""
+    either the whole old feed or the whole new one, never a half-written file. The new file has
+    a new inode; readers store the inode with their byte offset and reset to the tail when it
+    changes (an old offset into a rewritten file would skip posts). The injected-id set stops
+    any re-read from re-injecting."""
     posts, _ = read_feed(0)
     cutoff = time.time() - MAX_AGE_S
     recent = [p for p in posts if float(p.get("ts", 0)) >= cutoff]
@@ -248,7 +290,7 @@ def load_state(sid):
 
 
 def save_state(sid, s):
-    os.makedirs(STATE, exist_ok=True)
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=STATE, prefix=".tmp-")
     with os.fdopen(fd, "w") as f:
         json.dump(s, f)
@@ -369,19 +411,24 @@ def hook_post_tool(event, now=None):
             or not os.path.exists(tp) or not os.path.exists(FEED):
         return None
     st = load_state(sid)
-    fsize = os.path.getsize(FEED)
+    fst = os.stat(FEED)
+    fsize = fst.st_size
     off = st.get("off")
-    if off is None or off > fsize:
-        # first call in this session, or the feed was compacted since last time: bound the read
-        # to the tail. The age filter below drops anything older than MAX_AGE_S anyway.
+    if off is None or off > fsize or st.get("feed_ino") != fst.st_ino:
+        # first call in this session, or the feed was compacted (replaced) since last time: an
+        # old offset means nothing in the new file, so bound the read to the tail. The age
+        # filter below drops anything older than MAX_AGE_S anyway.
         off = tail_offset(fsize)
     queue = st.get("queue", [])
-    if off >= fsize and not queue:
+    if off >= fsize and not queue and st.get("feed_ino") == fst.st_ino:
         return None                                   # fast path: nothing new
     changed = False
     if off < fsize:
-        new, end = read_feed(off)
+        new, end, ino = read_feed_at(off)
+        if ino != fst.st_ino:       # replaced between stat and open: re-read the tail next call
+            new, end, ino = [], None, None
         st["off"] = end
+        st["feed_ino"] = ino
         changed = True
         others = [p for p in new if p.get("session") != sid and now - float(p.get("ts", 0)) <= MAX_AGE_S]
         if others:
@@ -407,9 +454,9 @@ def hook_post_tool(event, now=None):
                  "it, and ignore it if it does not bear on your work."]
         for q in pick:
             age = int((now - float(q["ts"])) / 60)
-            who = q["title"] or q["session"][:8]
+            who = flat(q["title"], 120) or flat(q["session"], 8)
             lines.append("- %s (%d min ago, session %s; shared: %s): %s"
-                         % (who, age, q["session"][:8], ", ".join(q["shared"]), q["text"]))
+                         % (who, age, flat(q["session"], 8), ", ".join(q["shared"]), flat(q["text"])))
         out = {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": "\n".join(lines)}}
         st["last_inject"] = now
         st["injected"] = (st.get("injected", []) + [q["id"] for q in pick])[-500:]
@@ -454,8 +501,9 @@ def main(argv):
     elif a.cmd == "tail":
         posts, _ = read_feed(0)
         for p in posts[-a.n:]:
-            print("%s  %-8s  %s  %s" % (time.strftime("%d %b %H:%M", time.localtime(p["ts"])), p["session"][:8],
-                                        p.get("title", "")[:40], p["text"][:200].replace("\n", " ")))
+            print("%s  %-8s  %s  %s" % (time.strftime("%d %b %H:%M", time.localtime(p["ts"])),
+                                        flat(p.get("session", ""), 8), flat(p.get("title", ""), 40),
+                                        flat(p["text"], 200)))
     elif a.cmd == "score":
         posts, _ = read_feed(0)
         corpus = [x["text"] for x in posts[-3000:]] + [a.task, a.post]
