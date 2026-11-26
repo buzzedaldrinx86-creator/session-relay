@@ -108,9 +108,12 @@ def valid_post(p):
     return True
 
 
+def post_fields(post):
+    return {key: post[key] for key in (*POST_FIELD_LIMITS, "ts") if key in post}
+
+
 def encode_post(post):
-    record = {k: post[k] for k in (*POST_FIELD_LIMITS, "ts") if k in post}
-    return (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    return (json.dumps(post_fields(post), ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def read_records(feed, offset, budget, skipping=False, line_limit=None):
@@ -139,7 +142,7 @@ def read_records(feed, offset, budget, skipping=False, line_limit=None):
         except (ValueError, RecursionError):
             continue
         if valid_post(record):
-            posts.append(record)
+            posts.append(post_fields(record))
     return posts, offset, skipping
 
 
@@ -340,12 +343,30 @@ def load_state(sid):
     return {}
 
 
+def state_payload(st):
+    # Keep the cursor and notice state when optional history grows beyond the read budget.
+    snapshot = dict(st)
+    while True:
+        payload = json.dumps(snapshot, separators=(",", ":")).encode("ascii")
+        if len(payload) <= MAX_STATE_BYTES:
+            return payload
+        history = snapshot.get("matched_ids")
+        queue = snapshot.get("queue")
+        if isinstance(history, list) and history:
+            snapshot["matched_ids"] = history[max(1, len(history) // 2):]
+        elif isinstance(queue, list) and queue:
+            snapshot["queue"] = queue[:len(queue) // 2]
+        else:
+            raise ValueError("relay session state exceeds its byte budget")
+
+
 def save_state(sid, st):
     name = state_name(sid)
+    payload = state_payload(st)
     with storage.directory(ROOT, create=True, private=True) as root:
         with storage.child_directory(root, STATE_NAME, create=True, private=True) as state:
-            with storage.replacement(state, name, "w") as f:
-                json.dump(st, f)
+            with storage.replacement(state, name, "wb") as f:
+                f.write(payload)
 
 
 # ---------------------------------------------------------------- transcript
@@ -447,9 +468,12 @@ def eligible_queue(st, now):
     queue = st.get("queue")
     if not isinstance(queue, list):
         return []
-    return [p for p in queue if valid_post(p) and
-            isinstance(p.get("s"), (int, float)) and 0 <= p["s"] <= 1 and
-            now - p["ts"] <= MAX_AGE_S]
+    return [
+        dict(post_fields(post), s=post["s"])
+        for post in queue
+        if valid_post(post) and isinstance(post.get("s"), (int, float))
+        and 0 <= post["s"] <= 1 and now - post["ts"] <= MAX_AGE_S
+    ]
 
 
 def hook_post_tool(event, now=None):

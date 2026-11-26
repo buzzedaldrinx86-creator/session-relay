@@ -261,6 +261,31 @@ class Fixes011(unittest.TestCase):
         relay.compact_feed()
         self.assertEqual([p["id"] for p in relay.read_feed(0)[0]], [good["id"]])
 
+    def test_received_post_keeps_only_supported_feed_fields_in_session_state(self):
+        record = {"id": "example", "session": "peerA", "ts": time.time(),
+                  "text": POSTS["billing"], "title": "Ledger review",
+                  "annotation": {"labels": ["reviewed"]}}
+        with open(relay.FEED, "w") as feed:
+            feed.write(json.dumps(record) + "\n")
+        event = {"session_id": "me", "transcript_path": self.tp}
+        self.assertIsNotNone(relay.hook_post_tool(event))
+        queued = relay.load_state("me")["queue"]
+        self.assertEqual([p["id"] for p in queued], ["example"])
+        self.assertEqual(queued[0]["title"], "Ledger review")
+        self.assertNotIn("annotation", queued[0])
+
+    def test_session_state_stays_readable_when_match_history_reaches_the_byte_budget(self):
+        history = ["ordinary-note-%03d" % number for number in range(32)]
+        state = {"off": 84, "notice_pending": True, "matched_ids": history}
+        with patch.object(relay, "MAX_STATE_BYTES", 320):
+            relay.save_state("me", state)
+            saved = relay.load_state("me")
+        self.assertEqual(saved.get("off"), 84)
+        self.assertTrue(saved["notice_pending"])
+        self.assertEqual(saved["matched_ids"][-1], history[-1])
+        self.assertNotIn(history[0], saved["matched_ids"])
+        self.assertEqual(state["matched_ids"], history)
+
     def test_append_remains_successful_if_compaction_fails(self):
         with patch.object(relay, "FEED_MAX_BYTES", 1), patch.object(
             relay, "compact_feed_locked", side_effect=RuntimeError("maintenance interrupted")
