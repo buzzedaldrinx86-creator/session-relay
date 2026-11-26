@@ -8,7 +8,7 @@
     {
       "name": "session-relay",
       "source": "./",
-      "description": "Push one Claude Code session's findings into other running sessions working on the same thing, mid-task. Local, stdlib-only, no network."
+      "description": "Match peer posts from parallel Claude Code sessions for local review. Python standard library only."
     }
   ]
 }

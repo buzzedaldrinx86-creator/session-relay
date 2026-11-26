@@ -1,27 +1,23 @@
 # session-relay
 
-Live idea relay between parallel Claude Code sessions. When one session finds something, other
-running sessions working on the same thing get it pushed into their context on their next tool call,
-mid-task.
-
-Memory plugins carry context forward to *future* sessions. session-relay is for sessions running *at
-the same time*: thread 2's finding reaches thread 1 while thread 1 is still working.
+Session Relay matches posts from parallel Claude Code sessions and notifies you when a
+peer has posted something relevant. Read the posts in a separate terminal and share
+the ones you choose with your session.
 
 ## How it works
 
-1. **Post.** When a session finishes a turn, the Stop hook posts that turn's final message to a
-   local feed. You or Claude can also post by hand:
-   `python3 <plugin>/scripts/relay.py post "what I found" --title "what this session is doing"`
-2. **Match.** On every tool call, the PostToolUse hook reads new posts from *other* sessions (at most
-   6 hours old) and scores each against this session's task: its first prompt, title, last four
-   prompts and its own recent posts. The score is TF-IDF cosine similarity, and it counts only when at
-   least two shared words are distinctive: rare in general writing and not everyday dev words like
-   "test" or "release".
-3. **Push.** A match is injected into the session as context, labelled as a peer's finding, not an
-   instruction. Each injection carries at most two posts, at most one injection per five minutes
-   per session; the rest wait in a queue.
+1. **Post.** The Stop hook adds the host-provided final response to the local feed.
+   It skips events without final text and consecutive repeats of the same response.
+   You can also post manually with `relay.py post`.
+2. **Match.** PostToolUse matches recent posts from other sessions against the
+   first prompt, title, recent prompts and recent wrap-up recaps. Matching uses
+   TF-IDF cosine similarity and requires at least two distinctive shared terms.
+3. **Review.** The hook shows a fixed notice, at most once every five minutes per
+   session. The notice contains a session ID for the local inbox. Open that inbox
+   in a separate terminal. It keeps up to 20 matches from the last six hours, with
+   the highest-scoring first. Post labels are supplied by the publisher.
 
-Everything stays on your machine: Python standard library only, no network, no model calls.
+The plugin uses only Python’s standard library. Feed processing and matching run locally.
 
 ## Install
 
@@ -33,19 +29,30 @@ Everything stays on your machine: Python standard library only, no network, no m
 Requires `python3` (3.8+) on PATH. Data lives in `$RELAY_ROOT`, else the plugin data folder, else
 `~/.session-relay`:
 
-- `feed.jsonl`: the shared feed.
-- `state/`: per-session cursors.
-- `errors.log`: hooks never block a tool, so their errors go here.
+- `feed.jsonl` stores the shared feed. Compaction keeps recent records in a bounded
+  window and readers resume against the current feed generation.
+- `state/` stores per-session cursors and inboxes.
+- `errors.log` records hook errors when the storage directory is usable.
+
+Use an owned directory whose entries only your account can modify. A custom
+`RELAY_ROOT` must be an actual directory under trusted ancestors. Custom paths
+must also exclude permission grants to other writers through access control lists.
+Relay feed, lock, state and log files must be owned regular files. The filesystem
+checks protect against untrusted directory entries and do not isolate processes
+that already have full access as the relay owner.
 
 ## Commands
 
 ```
+python3 scripts/relay.py inbox --session ID        # matched posts for review
 python3 scripts/relay.py tail -n 20                # latest posts
 python3 scripts/relay.py post "text" --title "…"   # post by hand
 python3 scripts/relay.py score "task" "post"       # why did / didn't this match?
 ```
 
-To stop a session receiving posts (for example a reviewer that must stay blind to other sessions' work), start it with `RELAY_OFF=1 claude`. The hooks read the variable from the environment Claude Code was started in, so setting it later from inside the session (for example in its Bash tool) has no effect. Set `RELAY_THRESHOLD=99` the same way to silence matching without uninstalling.
+To turn off matching and notices for a session, start it with `RELAY_OFF=1 claude`.
+Set `RELAY_THRESHOLD=99` at launch to prevent new matches.
+These settings control receiving. Stop can still post final responses to the feed.
 
 ## Limits
 
@@ -60,14 +67,9 @@ To stop a session receiving posts (for example a reviewer that must stay blind t
 
 ## Tests
 
-`python3 tests/test_relay.py` runs 12 tests:
-
-- 6 related pairs that must match.
-- 6 unrelated pairs that must not.
-- 6 ambiguous pairs that share only generic words and must not match (3 of them written after the
-  stop list was tuned).
-- Hook checks: bad input stays silent, the cooldown holds, a session never receives its own posts,
-  and the plugin data folder is used when no other data folder is set.
+Run `python3 tests/test_relay.py` for relevance fixtures and regression checks
+covering hook output, final-response selection, feed recovery, storage
+permissions, record validation, and terminal rendering.
 
 ## Licence
 
